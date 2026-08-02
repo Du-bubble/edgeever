@@ -82,7 +82,10 @@ jobs:
         run: |
           git config user.name "edgeever-updater[bot]"
           git config user.email "edgeever-updater[bot]@users.noreply.github.com"
-          git merge --no-edit -m "chore: update EdgeEver from ${TARGET_REF}" "${TARGET_COMMIT}"
+          git merge --no-edit --no-commit --no-ff -X theirs -m "chore: update EdgeEver from ${TARGET_REF}" "${TARGET_COMMIT}"
+          # Keep deployment-specific workflows owned by this repository.
+          git restore --source=HEAD --staged --worktree -- .github/workflows
+          git commit --no-edit
 
       - name: Set up Bun
         if: steps.upstream.outputs.update_required == 'true'
