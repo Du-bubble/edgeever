@@ -6,9 +6,16 @@
 !.env.android.local.example
 
 node_modules/
+.idea/
 dist/
 build/
+apps/extension/dist-firefox/
+apps/extension/web-ext-artifacts/
+release/desktop/
 coverage/
+
+# Rust sidecar build artifacts.
+target/
 
 .wrangler/
 .wrangler.generated-migrations/
@@ -24,3 +31,6 @@ wrangler.local.toml
 *.p12
 credentials.json
 *-key.pem
+
+# Local HyperFrames video workspace.
+/videos/edgeever-promo/

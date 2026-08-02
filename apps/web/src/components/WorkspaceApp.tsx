@@ -16,6 +16,7 @@ import { useInfiniteQuery, useQuery, useMutation, useQueryClient, type QueryClie
 import { Home, Search, UserRound, Plus, ChevronDown, ChevronRight, RefreshCw, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate } from "react-router";
+import * as m from "motion/react-m";
 import { Button } from "@/components/ui/button";
 import {
   Drawer,
@@ -34,10 +35,12 @@ import {
   getStandaloneMobileEditorReturningMemoId,
   openStandaloneMobileEditor,
   readMobileEditorReturnPreview,
+  requiresRemoteMemoForStandaloneMobileEditor,
   type MobileEditorReturnPreview,
 } from "@/lib/mobile-editor";
 import { cn } from "@/lib/utils";
-import { createExcerpt, docToText, getNotebookDescendantIds, type Notebook, type AuthUser, type MemoSummary, type MemoDetail } from "@edgeever/shared";
+import { isBrowserOffline, isBrowserOnline } from "@/lib/network-status";
+import { createExcerpt, docToText, getNotebookDescendantIds, resolveMemoContentDoc, type Notebook, type AuthUser, type MemoSummary, type MemoDetail, type Resource, type MemoTemplate as SavedMemoTemplate } from "@edgeever/shared";
 import { toggleMobileMemoSelection } from "@edgeever/shared/mobile-ui";
 import type {
   Pane,
@@ -55,12 +58,13 @@ import type {
   MemoSortMode,
 } from "@/lib/app-helpers";
 import {
-  DEFAULT_MEMO_TITLE,
   MIN_MEMO_LIST_WIDTH_PX,
   MAX_MEMO_LIST_WIDTH_PX,
   DEFAULT_MEMO_LIST_WIDTH_PX,
   isTextEntryTarget,
+  readSyncIntervalPreference,
   readImageCompressionPreference,
+  writeSyncIntervalPreference,
   writeImageCompressionPreference,
   readDesktopFocusModePreference,
   writeDesktopFocusModePreference,
@@ -80,11 +84,47 @@ import {
 } from "@/lib/app-helpers";
 import { useBrowserBackLayer } from "@/lib/app-hooks";
 import { updateMemoSummaryInLists, type MemoListQueryData } from "@/lib/memo-list-cache";
-import type { SyncQueueSummary } from "@/lib/sync-queue";
+import { emptySyncQueueSummary, type SyncQueueSummary } from "@/lib/sync-queue";
+import { notifyMemoIdRemapped } from "@/lib/sync-events";
+import {
+  createLocalDataScope,
+  putLocalMemo,
+  putLocalNotebook,
+  replaceLocalMemoId,
+} from "@/lib/local-mirror";
+import { createRepository } from "@/lib/repository";
+import {
+  refreshWorkspaceData,
+  resolveCreatedMemoSelection,
+  resolveSyncedMemoId,
+  shouldNavigateHomeWhenOpeningMemo,
+  type WorkspaceRefreshMode,
+} from "@/lib/workspace-refresh";
+import { useWorkspaceSyncLifecycle } from "@/hooks/useWorkspaceSyncLifecycle";
+import { paneEnterMotion } from "@/lib/motion";
+import { WorkspaceMotionProvider } from "./WorkspaceMotionProvider";
 
 const isDesktopViewport = () => window.matchMedia("(min-width: 1024px)").matches;
 const PULL_TO_REFRESH_TRIGGER_PX = 72;
 const PULL_TO_REFRESH_MAX_PX = 96;
+
+type ViewTransitionDocument = Document & {
+  startViewTransition?: (update: () => void) => unknown;
+};
+
+const runWorkspaceViewTransition = (update: () => void) => {
+  const viewTransitionDocument = document as ViewTransitionDocument;
+
+  if (
+    !viewTransitionDocument.startViewTransition ||
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  ) {
+    update();
+    return;
+  }
+
+  viewTransitionDocument.startViewTransition(update);
+};
 
 const isStandaloneApp = () =>
   window.matchMedia("(display-mode: standalone)").matches ||
@@ -116,19 +156,12 @@ const EvernoteImportGuidePane = lazy(() =>
   import("./EvernoteImportGuidePane").then((module) => ({ default: module.EvernoteImportGuidePane }))
 );
 const TagsPane = lazy(() => import("./TagsPane").then((module) => ({ default: module.TagsPane })));
-const TemplatesDialog = lazy(() => import("./dialogs/TemplatesDialog").then((module) => ({ default: module.TemplatesDialog })));
+const TemplatesPane = lazy(() => import("./TemplatesPane").then((module) => ({ default: module.TemplatesPane })));
 
 const SETTINGS_PATH = "/settings";
+const TEMPLATES_PATH = "/templates";
 const TRASH_VIEW_SEARCH = "?view=trash";
 const getMobileEditorReturnMemoId = (search: string) => new URLSearchParams(search).get(MOBILE_EDITOR_RETURN_PARAM);
-const emptySyncQueueSummary = (): SyncQueueSummary => ({
-  total: 0,
-  pending: 0,
-  syncing: 0,
-  conflict: 0,
-  error: 0,
-});
-
 const PaneLoadingFallback = ({ label = "Loading" }: { label?: string }) => (
   <div className="flex h-full min-h-0 items-center justify-center bg-white text-sm font-medium text-slate-400" role="status">
     {label}
@@ -160,7 +193,7 @@ const memoToSummary = (memo: MemoDetail): MemoSummary => ({
   id: memo.id,
   notebookId: memo.notebookId,
   title: memo.title,
-  excerpt: memo.excerpt || createExcerpt(memo.contentText || docToText(memo.contentJson) || memo.contentMarkdown),
+  excerpt: memo.excerpt || createExcerpt(memo.contentText || docToText(resolveMemoContentDoc(memo.contentJson, memo.contentMarkdown))),
   tags: memo.tags,
   isPinned: memo.isPinned,
   isArchived: memo.isArchived,
@@ -645,15 +678,25 @@ export const WorkspaceApp = ({
   const queryClient = useQueryClient();
   const location = useLocation();
   const navigate = useNavigate();
+  const localDataScope = useMemo(
+    () => createLocalDataScope(window.location.origin, user?.id),
+    [user?.id]
+  );
+  const repository = useMemo(() => createRepository(localDataScope), [localDataScope]);
   const isInitialSettingsRoute = location.pathname === SETTINGS_PATH;
+  const isInitialTemplatesRoute = location.pathname === TEMPLATES_PATH;
   const isInitialMobileEditorReturn = Boolean(getMobileEditorReturnMemoId(location.search));
   const isTrashRoute = location.pathname === "/" && location.search === TRASH_VIEW_SEARCH;
-  const [activePane, setActivePane] = useState<Pane>(() => (isInitialSettingsRoute && !isInitialMobileEditorReturn ? "editor" : "memos"));
+  const [activePane, setActivePane] = useState<Pane>(() => ((isInitialSettingsRoute || isInitialTemplatesRoute) && !isInitialMobileEditorReturn ? "editor" : "memos"));
   const [memoView, setMemoView] = useState<MemoView>(() => (isTrashRoute ? "trash" : "notebook"));
   const [selectedNotebookId, setSelectedNotebookId] = useState<string | null>(null);
   const autoSelectedDemoNotebookRef = useRef(false);
   const [selectedMemoId, setSelectedMemoId] = useState<string | null>(null);
+  const selectedMemoIdRef = useRef(selectedMemoId);
+  selectedMemoIdRef.current = selectedMemoId;
   const [createdMemoEditId, setCreatedMemoEditId] = useState<string | null>(null);
+  const pendingCreatedMemoIdRef = useRef<string | null>(null);
+  const creatingMemoSelectionRef = useRef(false);
   const [selectedMemoIds, setSelectedMemoIds] = useState<Set<string>>(new Set());
   const [memoSelectionMode, setMemoSelectionMode] = useState(false);
   const [selectionMoveTargetNotebookId, setSelectionMoveTargetNotebookId] = useState("");
@@ -690,15 +733,16 @@ export const WorkspaceApp = ({
   });
   const [multiSelectKeyDown, setMultiSelectKeyDown] = useState(false);
   const [imageCompressionEnabled, setImageCompressionEnabled] = useState(readImageCompressionPreference);
+  const [syncIntervalMs, setSyncIntervalMs] = useState(readSyncIntervalPreference);
   const [desktopFocusMode, setDesktopFocusMode] = useState(readDesktopFocusModePreference);
   const [shortcutSettings, setShortcutSettings] = useState<ShortcutSettings>(readShortcutSettingsPreference);
-  const [rightView, setRightView] = useState<"editor" | "settings" | "assets" | "tags" | "evernote-migration">(() =>
-    isInitialSettingsRoute ? "settings" : "editor"
+  const [rightView, setRightView] = useState<"editor" | "settings" | "assets" | "tags" | "templates" | "evernote-migration">(() =>
+    isInitialSettingsRoute ? "settings" : isInitialTemplatesRoute ? "templates" : "editor"
   );
   const [templatesOpen, setTemplatesOpen] = useState(false);
   const [mobileNotebookPickerOpen, setMobileNotebookPickerOpen] = useState(false);
   const [mobileBottomNavActive, setMobileBottomNavActive] = useState<MobileBottomNavItem>(() =>
-    isInitialSettingsRoute && !isInitialMobileEditorReturn ? "settings" : "home"
+    isInitialSettingsRoute && !isInitialMobileEditorReturn ? "settings" : isInitialTemplatesRoute ? "templates" : "home"
   );
   const [mobileSearchFocusToken, setMobileSearchFocusToken] = useState(0);
   const [noteSearchFocusToken, setNoteSearchFocusToken] = useState(0);
@@ -711,7 +755,7 @@ export const WorkspaceApp = ({
   const [mobileEditorReturnPreview, setMobileEditorReturnPreview] = useState<MobileEditorReturnPreview | null>(() =>
     readMobileEditorReturnPreview(getMobileEditorReturnMemoId(location.search))
   );
-  const [isOnline, setIsOnline] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine));
+  const [isOnline, setIsOnline] = useState(isBrowserOnline);
   const [isDesktop, setIsDesktop] = useState(isDesktopViewport);
   const [isSyncingQueuedChanges, setIsSyncingQueuedChanges] = useState(false);
   const [isManualMemoSyncing, setIsManualMemoSyncing] = useState(false);
@@ -746,8 +790,14 @@ export const WorkspaceApp = ({
     }
   };
 
+  const navigateWorkspaceTemplates = () => {
+    if (location.pathname !== TEMPLATES_PATH) {
+      navigate(TEMPLATES_PATH);
+    }
+  };
+
   const runQueuedSync = useCallback(async () => {
-    if (typeof navigator !== "undefined" && !navigator.onLine) {
+    if (isBrowserOffline()) {
       setIsOnline(false);
       return;
     }
@@ -755,23 +805,162 @@ export const WorkspaceApp = ({
     setIsSyncingQueuedChanges(true);
 
     try {
+      if (window.edgeeverDesktop?.isAvailable) {
+        const { getDesktopSyncSummary, syncDesktopData } = await import("@/lib/desktop-sync");
+        const result = await syncDesktopData();
+        if (result.memoIdMappings.size > 0) {
+          // Let the mounted editor transfer its live draft identity before
+          // React switches the selected memo to the server id.
+          notifyMemoIdRemapped(result.memoIdMappings);
+          pendingCreatedMemoIdRef.current = resolveSyncedMemoId(
+            result.memoIdMappings,
+            pendingCreatedMemoIdRef.current,
+          );
+          setCreatedMemoEditId((current) => resolveSyncedMemoId(result.memoIdMappings, current));
+          setSelectedMemoId((current) => resolveSyncedMemoId(result.memoIdMappings, current));
+        }
+        window.dispatchEvent(new CustomEvent("edgeever:sync-completed", { detail: result }));
+        setSyncSummary(await getDesktopSyncSummary());
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["memos"] }),
+          queryClient.invalidateQueries({ queryKey: ["memo"] }),
+          queryClient.invalidateQueries({ queryKey: ["notebooks"] }),
+        ]);
+        return;
+      }
       const { syncQueuedChanges } = await import("@/lib/sync-queue");
-      await syncQueuedChanges({
-        onSynced: async (memo) => {
+      const result = await syncQueuedChanges({
+        scope: localDataScope,
+        onSynced: async (memo, item) => {
+          if (item.kind === "memo.create") {
+            await replaceLocalMemoId(localDataScope, item.memoId, memo);
+            const remappedSelection = resolveCreatedMemoSelection(
+              selectedMemoIdRef.current,
+              pendingCreatedMemoIdRef.current,
+              item.memoId,
+              memo.id,
+            );
+            if (remappedSelection === memo.id) {
+              selectedMemoIdRef.current = memo.id;
+              setSelectedMemoId(memo.id);
+              // Keep the create intent attached to the remapped memo until
+              // the editor has consumed it. The list query may still contain
+              // the pre-sync snapshot for one render and would otherwise
+              // fall back to the first memo (the demo welcome note).
+              setCreatedMemoEditId(memo.id);
+              pendingCreatedMemoIdRef.current = memo.id;
+            }
+          } else {
+            await putLocalMemo(localDataScope, memo);
+          }
           cacheMemoDetail(queryClient, memo);
           await Promise.all([
             queryClient.invalidateQueries({ queryKey: ["memos"] }),
             queryClient.invalidateQueries({ queryKey: ["memo", memo.id] }),
           ]);
         },
+        onActionSynced: async (result, item) => {
+          if (!result || (item.kind !== "memo.merge" && item.kind !== "notebook.create" && item.kind !== "notebook.update" && item.kind !== "template.create" && item.kind !== "template.update" && item.kind !== "resource.create")) return;
+          const { deleteLocalMemo, deleteLocalNotebook, deleteLocalTemplate, getLocalMemo, putLocalMemo, putLocalNotebook, putLocalTemplate, putLocalResource } = await import("@/lib/local-mirror");
+          const actionPayload = item.payload as Record<string, unknown>;
+          const temporaryId = typeof actionPayload.temporaryId === "string" ? actionPayload.temporaryId : null;
+          if (item.kind === "resource.create" && "url" in result) {
+            await putLocalResource(localDataScope, {
+              ...(result as Resource),
+              memoTitle: null,
+              memoExcerpt: null,
+              memoDeleted: false,
+            });
+          } else if (item.kind === "memo.merge" && "contentJson" in result && temporaryId) {
+            await deleteLocalMemo(localDataScope, temporaryId, true);
+            await putLocalMemo(localDataScope, result as MemoDetail);
+            const sourceIds = Array.isArray(actionPayload.memoIds) ? actionPayload.memoIds.filter((value): value is string => typeof value === "string") : [];
+            await Promise.all(sourceIds.map(async (sourceId) => {
+              const source = await getLocalMemo(localDataScope, sourceId);
+              if (source) await putLocalMemo(localDataScope, { ...source, mergedIntoMemoId: (result as MemoDetail).id });
+            }));
+          } else if (item.kind === "notebook.create" && "name" in result && temporaryId) {
+            await deleteLocalNotebook(localDataScope, temporaryId);
+            await putLocalNotebook(localDataScope, result as Notebook);
+          } else if (item.kind === "notebook.update" && "name" in result) {
+            await putLocalNotebook(localDataScope, result as Notebook);
+          } else if (item.kind === "template.create" && "contentMarkdown" in result && temporaryId) {
+            await deleteLocalTemplate(localDataScope, temporaryId);
+            await putLocalTemplate(localDataScope, result as SavedMemoTemplate);
+          } else if (item.kind === "template.update" && "contentMarkdown" in result) {
+            await putLocalTemplate(localDataScope, result as SavedMemoTemplate);
+          }
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: ["memos"] }),
+            queryClient.invalidateQueries({ queryKey: ["notebooks"] }),
+            queryClient.invalidateQueries({ queryKey: ["templates"] }),
+            queryClient.invalidateQueries({ queryKey: ["resources"] }),
+          ]);
+        },
       });
+      window.dispatchEvent(new CustomEvent("edgeever:sync-completed", { detail: result }));
     } finally {
       setIsSyncingQueuedChanges(false);
     }
+  }, [localDataScope, queryClient]);
+
+  const discardConflictsNow = useCallback(async () => {
+    if (!isOnline) return;
+    setIsSyncingQueuedChanges(true);
+    try {
+      if (window.edgeeverDesktop?.isAvailable) {
+        const { discardDesktopConflicts, getDesktopSyncSummary } = await import("@/lib/desktop-sync");
+        await discardDesktopConflicts();
+        setSyncSummary(await getDesktopSyncSummary());
+      } else {
+        const { discardWebConflicts } = await import("@/lib/sync-queue");
+        await discardWebConflicts(localDataScope);
+      }
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["memos"] }),
+        queryClient.invalidateQueries({ queryKey: ["memo"] }),
+      ]);
+    } finally {
+      setIsSyncingQueuedChanges(false);
+    }
+  }, [isOnline, queryClient]);
+
+  const invalidateWorkspaceQueries = useCallback(async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["memos"] }),
+      queryClient.invalidateQueries({ queryKey: ["memo"] }),
+      queryClient.invalidateQueries({ queryKey: ["notebooks"] }),
+      queryClient.invalidateQueries({ queryKey: ["tags"] }),
+      queryClient.invalidateQueries({ queryKey: ["resources"], refetchType: "all" }),
+    ]);
   }, [queryClient]);
 
+  const refreshWorkspaceFromServer = useCallback(async (mode: WorkspaceRefreshMode) => {
+    if (isBrowserOffline()) {
+      setIsOnline(false);
+      return { changed: 0, skipped: true };
+    }
+
+    const isDesktopRuntime = Boolean(window.edgeeverDesktop?.isAvailable);
+
+    return refreshWorkspaceData({
+      mode,
+      hasPendingLocalChanges: syncSummary.total > 0,
+      // Desktop sync already pushes the outbox and pulls remote changes in
+      // one operation. The web repository keeps those phases separate.
+      pushLocalChanges: isDesktopRuntime ? async () => undefined : runQueuedSync,
+      pullRemoteChanges: isDesktopRuntime
+        ? async () => {
+            await runQueuedSync();
+            return { changed: 0 };
+          }
+        : repository.sync,
+      invalidateWorkspaceQueries,
+    });
+  }, [invalidateWorkspaceQueries, repository, runQueuedSync, syncSummary.total]);
+
   const refreshLatestMemos = useCallback(async () => {
-    if (typeof navigator !== "undefined" && !navigator.onLine) {
+    if (isBrowserOffline()) {
       setIsOnline(false);
       setPullToRefreshDistance(0);
       return;
@@ -780,19 +969,15 @@ export const WorkspaceApp = ({
     setIsPullRefreshing(true);
 
     try {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["memos"] }),
-        queryClient.invalidateQueries({ queryKey: ["memo"] }),
-        queryClient.invalidateQueries({ queryKey: ["notebooks"] }),
-      ]);
+      await refreshWorkspaceFromServer("manual");
     } finally {
       setIsPullRefreshing(false);
       setPullToRefreshDistance(0);
     }
-  }, [queryClient]);
+  }, [refreshWorkspaceFromServer]);
 
   const syncMemosManually = useCallback(async () => {
-    if (typeof navigator !== "undefined" && !navigator.onLine) {
+    if (isBrowserOffline()) {
       setIsOnline(false);
       return;
     }
@@ -800,22 +985,24 @@ export const WorkspaceApp = ({
     setIsManualMemoSyncing(true);
 
     try {
-      await runQueuedSync();
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["memos"] }),
-        queryClient.invalidateQueries({ queryKey: ["memo"] }),
-        queryClient.invalidateQueries({ queryKey: ["notebooks"] }),
-        queryClient.invalidateQueries({ queryKey: ["resources"], refetchType: "all" }),
-      ]);
+      await refreshWorkspaceFromServer("manual");
     } finally {
       setIsManualMemoSyncing(false);
     }
-  }, [queryClient, runQueuedSync]);
+  }, [refreshWorkspaceFromServer]);
 
   const notebooksQuery = useQuery({
     queryKey: ["notebooks"],
-    queryFn: () => api.listNotebooks(),
+    queryFn: () => repository.listNotebooks(),
   });
+
+  const templatesQuery = useQuery({
+    queryKey: ["templates"],
+    queryFn: () => repository.listTemplates(),
+    enabled: rightView === "templates",
+  });
+
+  const savedTemplates = templatesQuery.data?.templates ?? [];
 
   const notebooks = notebooksQuery.data?.notebooks ?? [];
   useEffect(() => {
@@ -838,7 +1025,10 @@ export const WorkspaceApp = ({
     notebooks.find(
       (notebook) => notebook.id === "nb_inbox" || notebook.slug === "inbox" || notebook.name === "等待分类"
     )?.id ?? null;
-  const canCreateMemo = Boolean(defaultMemoNotebookId && memoView !== "trash");
+  const createMemoNotebookId =
+    (selectedNotebookId && notebooks.some((notebook) => notebook.id === selectedNotebookId) ? selectedNotebookId : null) ??
+    defaultMemoNotebookId;
+  const canCreateMemo = Boolean(createMemoNotebookId && memoView !== "trash");
   const memoSelectionModeActive = memoSelectionMode || selectedMemoIds.size > 0;
   const mobileSearchActive = mobileBottomNavActive === "search";
   const workspaceBackTargetActive = Boolean(
@@ -878,7 +1068,10 @@ export const WorkspaceApp = ({
     setMemoSelectionMode(false);
   }, []);
 
-  const clearPendingCreatedMemo = useCallback(() => {}, []);
+  const clearPendingCreatedMemo = useCallback(() => {
+    pendingCreatedMemoIdRef.current = null;
+    creatingMemoSelectionRef.current = false;
+  }, []);
 
   const applyMobileEditorReturnPreview = useCallback((memoId: string | null) => {
     const returnPreview = readMobileEditorReturnPreview(memoId);
@@ -995,11 +1188,34 @@ export const WorkspaceApp = ({
   }, [imageCompressionEnabled]);
 
   useEffect(() => {
+    writeSyncIntervalPreference(
+      syncIntervalMs === null ? "off" : syncIntervalMs === 300_000 ? "5m" : syncIntervalMs === 900_000 ? "15m" : syncIntervalMs === 1_800_000 ? "30m" : syncIntervalMs === 3_600_000 ? "1h" : syncIntervalMs === 7_200_000 ? "2h" : "30s"
+    );
+  }, [syncIntervalMs]);
+
+  useEffect(() => {
     writeShortcutSettingsPreference(shortcutSettings);
   }, [shortcutSettings]);
 
   useEffect(() => {
-    void import("./EditorPane");
+    let timeoutId: number | null = null;
+    let idleId: number | null = null;
+    const prefetchEditor = () => {
+      void import("./EditorPane");
+    };
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    if (idleWindow.requestIdleCallback) {
+      idleId = idleWindow.requestIdleCallback(prefetchEditor, { timeout: 2500 });
+    } else {
+      timeoutId = window.setTimeout(prefetchEditor, 1200);
+    }
+    return () => {
+      if (idleId !== null) idleWindow.cancelIdleCallback?.(idleId);
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+    };
   }, []);
 
   useEffect(() => {
@@ -1007,6 +1223,14 @@ export const WorkspaceApp = ({
       skipNextHomeRouteSyncRef.current = false;
       setRightView("settings");
       setMobileBottomNavActive("settings");
+      setActivePane("editor");
+      return;
+    }
+
+    if (location.pathname === TEMPLATES_PATH) {
+      skipNextHomeRouteSyncRef.current = false;
+      setRightView("templates");
+      setMobileBottomNavActive("templates");
       setActivePane("editor");
       return;
     }
@@ -1022,6 +1246,15 @@ export const WorkspaceApp = ({
   }, [isTrashRoute, location.pathname]);
 
   useEffect(() => {
+    if (window.edgeeverDesktop?.isAvailable) {
+      let active = true;
+      const update = async () => {
+        const { getDesktopSyncSummary } = await import("@/lib/desktop-sync");
+        if (active) setSyncSummary(await getDesktopSyncSummary());
+      };
+      void update();
+      return () => { active = false; };
+    }
     let unsubscribe: (() => void) | undefined;
     let active = true;
 
@@ -1127,13 +1360,7 @@ export const WorkspaceApp = ({
 
       if (shouldRefresh) {
         setPullToRefreshDistance(PULL_TO_REFRESH_TRIGGER_PX);
-        if (isStandaloneRuntime) {
-          void refreshLatestMemos();
-          return;
-        }
-
-        setIsPullRefreshing(true);
-        window.location.reload();
+        void refreshLatestMemos();
       }
     };
 
@@ -1148,62 +1375,15 @@ export const WorkspaceApp = ({
       document.removeEventListener("touchend", handleTouchEnd);
       document.removeEventListener("touchcancel", reset);
     };
-  }, [isStandaloneRuntime, mobilePullToRefreshActive, refreshLatestMemos]);
+  }, [mobilePullToRefreshActive, refreshLatestMemos]);
 
-  useEffect(() => {
-    const updateOnlineState = () => {
-      const online = navigator.onLine;
-      setIsOnline(online);
-      if (online) {
-        void runQueuedSync();
-      }
-    };
-
-    window.addEventListener("online", updateOnlineState);
-    window.addEventListener("offline", updateOnlineState);
-    updateOnlineState();
-
-    return () => {
-      window.removeEventListener("online", updateOnlineState);
-      window.removeEventListener("offline", updateOnlineState);
-    };
-  }, [runQueuedSync]);
-
-  useEffect(() => {
-    if (!isStandaloneRuntime) {
-      return;
-    }
-
-    const refreshWorkspaceQueries = () => {
-      if (document.visibilityState === "hidden" || (typeof navigator !== "undefined" && !navigator.onLine)) {
-        return;
-      }
-
-      void Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["memos"] }),
-        queryClient.invalidateQueries({ queryKey: ["notebooks"] }),
-      ]);
-    };
-
-    window.addEventListener("pageshow", refreshWorkspaceQueries);
-    document.addEventListener("visibilitychange", refreshWorkspaceQueries);
-
-    return () => {
-      window.removeEventListener("pageshow", refreshWorkspaceQueries);
-      document.removeEventListener("visibilitychange", refreshWorkspaceQueries);
-    };
-  }, [isStandaloneRuntime, queryClient]);
-
-  useEffect(() => {
-    if (syncSummary.total === 0) {
-      return;
-    }
-    const timer = window.setInterval(() => {
-      void runQueuedSync();
-    }, 15_000);
-
-    return () => window.clearInterval(timer);
-  }, [runQueuedSync, syncSummary.total]);
+  useWorkspaceSyncLifecycle({
+    pendingSyncCount: syncSummary.total,
+    refreshWorkspace: refreshWorkspaceFromServer,
+    runQueuedSync,
+    setOnline: setIsOnline,
+    syncIntervalMs,
+  });
 
   const selectedNotebookDescendantIds = useMemo(
     () => (selectedNotebookId ? getNotebookDescendantIds(notebooks, selectedNotebookId) : []),
@@ -1211,15 +1391,14 @@ export const WorkspaceApp = ({
   );
   const memosQuery = useInfiniteQuery({
     queryKey: ["memos", memoView, selectedNotebookId, search, memoFilterMode, memoSortMode, selectedNotebookDescendantIds],
-    queryFn: ({ pageParam }) =>
-      api.listMemos({
+    queryFn: ({ pageParam }) => repository.listMemos({
         notebookId: memoView === "notebook" ? selectedNotebookId : null,
-        includeDescendants: memoView === "notebook" && Boolean(selectedNotebookId),
+        notebookIds: memoView === "notebook" ? selectedNotebookDescendantIds : undefined,
         q: search,
         trash: memoView === "trash",
         filter: memoFilterMode,
         sort: memoSortMode,
-        cursor: pageParam,
+        offset: pageParam ? Number(pageParam) : 0,
       }),
     initialPageParam: null as string | null,
     getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
@@ -1262,9 +1441,21 @@ export const WorkspaceApp = ({
   const previousMemoId = selectedMemoIndex > 0 ? memos[selectedMemoIndex - 1]?.id : null;
   const nextMemoId =
     selectedMemoIndex >= 0 && selectedMemoIndex < memos.length - 1 ? memos[selectedMemoIndex + 1]?.id : null;
+  const detailMemoId = selectedMemoId ?? memos[0]?.id ?? null;
 
   useEffect(() => {
     const selectedMemoInList = selectedMemoId ? memos.some((memo) => memo.id === selectedMemoId) : false;
+
+    if (creatingMemoSelectionRef.current || pendingCreatedMemoIdRef.current) {
+      return;
+    }
+
+    if (createdMemoEditId && selectedMemoId === createdMemoEditId) {
+      // Keep the create request alive until the editor consumes it. The new
+      // memo can appear in the list before its detail query has mounted the
+      // editor, and clearing it here would lose the autofocus request.
+      return;
+    }
 
     if (memos.length === 0) {
       setSelectedMemoId(null);
@@ -1274,17 +1465,32 @@ export const WorkspaceApp = ({
     if (!selectedMemoId || !selectedMemoInList) {
       setSelectedMemoId(memos[0].id);
     }
-  }, [memos, selectedMemoId]);
+  }, [createdMemoEditId, memos, selectedMemoId]);
 
   const memoQuery = useQuery({
-    queryKey: selectedMemoId ? memoDetailQueryKey(selectedMemoId, memoView) : ["memo", selectedMemoId, memoView],
-    queryFn: () => api.getMemo(selectedMemoId as string, { includeDeleted: memoView === "trash" }),
-    enabled: Boolean(selectedMemoId),
+    queryKey: detailMemoId ? memoDetailQueryKey(detailMemoId, memoView) : ["memo", detailMemoId, memoView],
+    queryFn: () => repository.getMemo(detailMemoId as string, memoView === "trash"),
+    enabled: Boolean(detailMemoId),
   });
 
+  useEffect(() => {
+    const handleMemoDetailRefreshed = (event: Event) => {
+      const memo = (event as CustomEvent<MemoDetail>).detail;
+      if (!memo?.id) return;
+
+      queryClient.setQueryData(memoDetailQueryKey(memo.id, "notebook"), { memo });
+      queryClient.setQueryData(memoDetailQueryKey(memo.id, "trash"), { memo });
+      updateMemoSummaryInLists(queryClient, memoToSummary(memo));
+    };
+
+    window.addEventListener("edgeever:memo-detail-refreshed", handleMemoDetailRefreshed);
+    return () => window.removeEventListener("edgeever:memo-detail-refreshed", handleMemoDetailRefreshed);
+  }, [queryClient]);
+
   const createNotebookMutation = useMutation({
-    mutationFn: api.createNotebook,
+    mutationFn: repository.createNotebook,
     onSuccess: async (data) => {
+      await putLocalNotebook(localDataScope, data.notebook);
       await queryClient.invalidateQueries({ queryKey: ["notebooks"] });
       setSelectedNotebookId(data.notebook.id);
       setActivePane("memos");
@@ -1298,14 +1504,17 @@ export const WorkspaceApp = ({
     }: {
       notebookId: string;
       payload: { name?: string; parentId?: string | null; sortOrder?: number };
-    }) => api.updateNotebook(notebookId, payload),
-    onSuccess: async () => {
+    }) => repository.updateNotebook(notebookId, payload),
+    onSuccess: async (data) => {
+      if (data?.notebook) {
+        await putLocalNotebook(localDataScope, data.notebook);
+      }
       await queryClient.invalidateQueries({ queryKey: ["notebooks"] });
     },
   });
 
   const deleteNotebookMutation = useMutation({
-    mutationFn: api.deleteNotebook,
+    mutationFn: repository.deleteNotebook,
     onSuccess: async (_data, notebookId) => {
       if (selectedNotebookId === notebookId) {
         setSelectedNotebookId(null);
@@ -1317,12 +1526,25 @@ export const WorkspaceApp = ({
   });
 
   const createMemoMutation = useMutation({
-    mutationFn: api.createMemo,
+    mutationFn: async (input: Parameters<typeof repository.createMemo>[0]) => {
+      const requiresRemoteMemo = requiresRemoteMemoForStandaloneMobileEditor({
+        mobileViewport: !isDesktopViewport(),
+        desktopRuntime: Boolean(window.edgeeverDesktop?.isAvailable),
+      });
+      const data = requiresRemoteMemo ? await api.createMemo(input) : await repository.createMemo(input);
+      await putLocalMemo(localDataScope, data.memo);
+      return data;
+    },
     onSuccess: (data) => {
       const targetNotebookId = data.memo.notebookId;
 
       setMemoView("notebook");
       setSearch("");
+      // A newly created memo is not pinned or otherwise guaranteed to match
+      // the active list filter. Leave filtered views so the selected memo
+      // remains visible instead of the list effect falling back to its first
+      // item (for example, the currently pinned memo).
+      setMemoFilterMode("all");
       if (targetNotebookId !== selectedNotebookId) {
         setSelectedNotebookId(targetNotebookId);
       }
@@ -1334,6 +1556,7 @@ export const WorkspaceApp = ({
       ]);
       navigateWorkspaceHome();
       setRightView("editor");
+      pendingCreatedMemoIdRef.current = data.memo.id;
       setCreatedMemoEditId(data.memo.id);
       setSelectedMemoId(data.memo.id);
       setActivePane("editor");
@@ -1342,10 +1565,81 @@ export const WorkspaceApp = ({
         openStandaloneMobileEditor(data.memo.id);
       }
     },
+    onError: () => {
+      clearPendingCreatedMemo();
+      setCreatedMemoEditId(null);
+    },
+  });
+
+  const saveTemplateMutation = useMutation({
+    mutationFn: (input: { name: string; memoId: string }) => repository.createTemplate(input),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["templates"] });
+      setAppNoticeDialog({ title: t("templates.templateSaved"), description: t("templates.templateSaved") });
+    },
+  });
+
+  const createTemplateMutation = useMutation({
+    mutationFn: (input: { name: string; description: string | null; title: string | null; contentMarkdown: string; tags: string[] }) =>
+      repository.createTemplate(input),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["templates"] });
+      setAppNoticeDialog({ title: t("templates.templateCreated"), description: t("templates.templateCreated") });
+    },
+  });
+
+  const useTemplateMutation = useMutation({
+    mutationFn: async (input: { templateId: string; notebookId: string }) => {
+      const requiresRemoteMemo = requiresRemoteMemoForStandaloneMobileEditor({
+        mobileViewport: !isDesktopViewport(),
+        desktopRuntime: Boolean(window.edgeeverDesktop?.isAvailable),
+      });
+      const data = requiresRemoteMemo
+        ? await api.useTemplate(input.templateId, input.notebookId)
+        : await repository.useTemplate(input.templateId, input.notebookId);
+      await putLocalMemo(localDataScope, data.memo);
+      return data;
+    },
+    onSuccess: (data) => {
+      const targetNotebookId = data.memo.notebookId;
+      setTemplatesOpen(false);
+      setMemoView("notebook");
+      setSearch("");
+      setSelectedNotebookId(targetNotebookId);
+      cacheMemoDetail(queryClient, data.memo, "notebook");
+      updateMemoSummaryInLists(queryClient, memoToSummary(data.memo));
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["memos"] }),
+        queryClient.invalidateQueries({ queryKey: ["notebooks"] }),
+      ]);
+      navigateWorkspaceHome();
+      setRightView("editor");
+      setCreatedMemoEditId(data.memo.id);
+      setSelectedMemoId(data.memo.id);
+      setActivePane("editor");
+      if (!isDesktopViewport()) openStandaloneMobileEditor(data.memo.id);
+    },
+  });
+
+  const deleteTemplateMutation = useMutation({
+    mutationFn: (templateId: string) => repository.deleteTemplate(templateId),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["templates"] });
+    },
+  });
+
+  const updateTemplateMutation = useMutation({
+    mutationFn: (input: {
+      templateId: string;
+      payload: { name: string; description: string | null; title: string | null; contentMarkdown: string; tags: string[] };
+    }) => repository.updateTemplate(input.templateId, input.payload),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["templates"] });
+    },
   });
 
   const mergeMutation = useMutation({
-    mutationFn: api.mergeMemos,
+    mutationFn: repository.mergeMemos,
     onSuccess: async (data) => {
       clearMemoSelection();
       cacheMemoDetail(queryClient, data.memo, "notebook");
@@ -1361,7 +1655,7 @@ export const WorkspaceApp = ({
   });
 
   const moveMemosMutation = useMutation({
-    mutationFn: api.moveMemos,
+    mutationFn: repository.moveMemos,
     onSuccess: async () => {
       clearMemoSelection();
       await Promise.all([
@@ -1373,8 +1667,7 @@ export const WorkspaceApp = ({
   });
 
   const pinMemosMutation = useMutation({
-    mutationFn: async ({ memoIds, isPinned }: { memoIds: string[]; isPinned: boolean }) =>
-      Promise.all(memoIds.map((memoId) => api.updateMemo(memoId, { isPinned }))),
+    mutationFn: repository.pinMemos,
     onMutate: async ({ memoIds, isPinned }) => {
       await Promise.all([
         queryClient.cancelQueries({ queryKey: ["memos"] }),
@@ -1409,7 +1702,7 @@ export const WorkspaceApp = ({
   });
 
   const deleteMemosMutation = useMutation({
-    mutationFn: api.deleteMemos,
+    mutationFn: repository.deleteMemos,
     onMutate: async (variables): Promise<MemoDeleteOptimisticContext> => {
       const deletedMemoIds = new Set(variables.memoIds);
       await Promise.all([
@@ -1466,8 +1759,9 @@ export const WorkspaceApp = ({
   });
 
   const deleteMemoMutation = useMutation({
-    mutationFn: ({ memoId, permanent }: { memoId: string; permanent?: boolean }) =>
-      api.deleteMemo(memoId, { permanent }),
+    mutationFn: async ({ memoId, permanent }: { memoId: string; permanent?: boolean }) => {
+      return repository.deleteMemo(memoId, Boolean(permanent));
+    },
     onMutate: async (variables): Promise<MemoDeleteOptimisticContext> => {
       const deletedMemoIds = new Set([variables.memoId]);
       await Promise.all([
@@ -1517,8 +1811,15 @@ export const WorkspaceApp = ({
   });
 
   const emptyTrashMutation = useMutation({
-    mutationFn: api.emptyTrash,
+    mutationFn: repository.emptyTrash,
     onMutate: async (): Promise<EmptyTrashOptimisticContext> => {
+      const previousActivePane = activePane;
+      const previousSelectedMemoId = selectedMemoId;
+
+      // Leave the editor before cancelling/refetching its detail query. On a
+      // desktop layout the editor remains mounted even when the memo pane is
+      // visible, so keeping a trashed memo selected while its query is being
+      // invalidated can render a deleted detail and repeatedly re-select it.
       setEmptyTrashConfirmationOpen(false);
       clearMemoSelection();
       setSelectedMemoId(null);
@@ -1533,14 +1834,12 @@ export const WorkspaceApp = ({
       const previousMemoLists = queryClient.getQueriesData<MemoListQueryData>({ queryKey: ["memos"] });
       const previousMemoDetails = queryClient.getQueriesData<{ memo: MemoDetail }>({ queryKey: ["memo"] });
 
+      // Keep the optimistic update limited to list data. Removing the active
+      // memo detail query here can make the editor render with a missing memo
+      // during the same React update and blank the whole workspace.
       clearTrashMemoLists(queryClient);
-      for (const [queryKey] of previousMemoDetails) {
-        if (queryKey[2] === "trash") {
-          queryClient.removeQueries({ queryKey });
-        }
-      }
 
-      return { previousMemoLists, previousMemoDetails, previousActivePane: activePane, previousSelectedMemoId: selectedMemoId };
+      return { previousMemoLists, previousMemoDetails, previousActivePane, previousSelectedMemoId };
     },
     onError: (_error, _variables, context) => {
       context?.previousMemoLists.forEach(([queryKey, data]) => {
@@ -1556,19 +1855,31 @@ export const WorkspaceApp = ({
         description: t("workspaceDialogs.emptyTrashFailedDescription"),
       });
     },
-    onSettled: (_data, error) => {
-      const refetchType = error ? "active" : "inactive";
-
+    onSuccess: () => {
+      // The trash detail queries are no longer valid after a successful
+      // permanent delete. Remove them before invalidating the remaining
+      // active queries so an editor cannot briefly observe a 404 detail.
+      queryClient.removeQueries({
+        queryKey: ["memo"],
+        predicate: (query) => {
+          const data = query.state.data as { memo?: { isDeleted?: boolean } } | undefined;
+          return data?.memo?.isDeleted === true;
+        },
+      });
+      setSelectedMemoId(null);
+      setActivePane("memos");
+    },
+    onSettled: () => {
       void Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["memos"], refetchType }),
-        queryClient.invalidateQueries({ queryKey: ["memo"], refetchType }),
-        queryClient.invalidateQueries({ queryKey: ["resources"], refetchType }),
+        queryClient.invalidateQueries({ queryKey: ["memos"], refetchType: "active" }),
+        queryClient.invalidateQueries({ queryKey: ["memo"], refetchType: "active" }),
+        queryClient.invalidateQueries({ queryKey: ["resources"], refetchType: "active" }),
       ]);
     },
   });
 
   const restoreMemoMutation = useMutation({
-    mutationFn: api.restoreMemo,
+    mutationFn: repository.restoreMemo,
     onSuccess: (data) => {
       setMemoView("notebook");
       cacheMemoDetail(queryClient, data.memo, "notebook");
@@ -1586,8 +1897,8 @@ export const WorkspaceApp = ({
   });
 
   const selectedNotebook = notebooks.find((notebook) => notebook.id === selectedNotebookId) ?? null;
-  const cachedSelectedMemo = selectedMemoId
-    ? queryClient.getQueryData<{ memo: MemoDetail }>(memoDetailQueryKey(selectedMemoId, memoView))?.memo ?? null
+  const cachedSelectedMemo = detailMemoId
+    ? queryClient.getQueryData<{ memo: MemoDetail }>(memoDetailQueryKey(detailMemoId, memoView))?.memo ?? null
     : null;
   const selectedMemo = memoQuery.data?.memo ?? cachedSelectedMemo;
   const desktopFocusModeActive = Boolean(
@@ -1659,21 +1970,34 @@ export const WorkspaceApp = ({
   };
 
   const handleCreateMemo = (template?: MemoTemplate) => {
-    if (!defaultMemoNotebookId || memoView === "trash") {
+    const targetNotebookId = createMemoNotebookId;
+
+    if (!targetNotebookId || memoView === "trash") {
       return;
     }
 
     setTemplatesOpen(false);
     setMobileBottomNavActive("home");
+    creatingMemoSelectionRef.current = true;
     createMemoMutation.mutate({
-      notebookId: defaultMemoNotebookId,
-      title: template?.title ?? DEFAULT_MEMO_TITLE,
+      notebookId: targetNotebookId,
+      title: template?.title ?? "",
       contentMarkdown: template?.contentMarkdown ?? "",
       tags: template?.tags ?? [],
     });
   };
 
+  const handleSaveAsTemplate = async (memo: MemoDetail, name: string) => {
+    await saveTemplateMutation.mutateAsync({ name, memoId: memo.id });
+  };
+
+  const handleUseSavedTemplate = (template: SavedMemoTemplate) => {
+    if (!createMemoNotebookId || memoView === "trash") return;
+    useTemplateMutation.mutate({ templateId: template.id, notebookId: createMemoNotebookId });
+  };
+
   const handleMobileDefaultEditConsumed = useCallback(() => {
+    pendingCreatedMemoIdRef.current = null;
     setCreatedMemoEditId(null);
   }, []);
 
@@ -1929,6 +2253,7 @@ export const WorkspaceApp = ({
     navigateWorkspaceHome();
     setMemoView("notebook");
     setSelectedNotebookId(null);
+    setRightView("editor");
     setMobileBottomNavActive("home");
     clearMemoSelection();
     clearPendingCreatedMemo();
@@ -1988,9 +2313,12 @@ export const WorkspaceApp = ({
 
   const handleOpenTemplates = () => {
     clearHiddenMobileSearch();
+    navigateWorkspaceTemplates();
+    setRightView("templates");
     setMobileBottomNavActive("templates");
-    setTemplatesOpen(true);
+    setActivePane("editor");
   };
+
 
   const handleOpenSettings = () => {
     clearHiddenMobileSearch();
@@ -2008,6 +2336,8 @@ export const WorkspaceApp = ({
 
   const handleCloseTemplates = () => {
     setTemplatesOpen(false);
+    navigateWorkspaceHome();
+    setRightView("editor");
     setMobileBottomNavActive("home");
   };
 
@@ -2021,13 +2351,53 @@ export const WorkspaceApp = ({
   };
 
   const updateDesktopFocusMode = useCallback((enabled: boolean) => {
-    setDesktopFocusMode(enabled);
-    writeDesktopFocusModePreference(enabled);
+    runWorkspaceViewTransition(() => {
+      setDesktopFocusMode(enabled);
+      writeDesktopFocusModePreference(enabled);
+    });
   }, []);
 
   const toggleDesktopFocusMode = useCallback(() => {
     updateDesktopFocusMode(!desktopFocusModeActive);
   }, [desktopFocusModeActive, updateDesktopFocusMode]);
+
+  useEffect(() => {
+    const bridge = window.edgeeverDesktop;
+    if (!bridge?.isAvailable) return;
+    const removeCommandListener = bridge.onCommand((command) => {
+      if (command === "new-memo") handleCreateMemo();
+      if (command === "new-notebook") handleCreateNotebook();
+      if (command === "focus-search") handleMobileSearch();
+      if (command === "toggle-focus-mode") toggleDesktopFocusMode();
+      if (command === "sync-now") {
+        void runQueuedSync();
+      }
+      if (command === "backup-now") {
+        void bridge.sidecarRequest("storage.backup", {});
+      }
+      if (command.startsWith("open-memo:")) {
+        const memoId = command.slice("open-memo:".length);
+        if (memoId) {
+          navigateWorkspaceHome();
+          setMemoView("notebook");
+          setSelectedMemoId(memoId);
+          setActivePane("editor");
+        }
+      }
+    });
+    const removeMarkdownListener = bridge.onImportMarkdown((payload) => {
+      const notebookId = selectedNotebookId && notebooks.some((notebook) => notebook.id === selectedNotebookId)
+        ? selectedNotebookId
+        : defaultMemoNotebookId;
+      if (!notebookId) return;
+      const title = payload.name.replace(/\.(?:md|markdown)$/i, "").trim();
+      createMemoMutation.mutate({ notebookId, title, contentMarkdown: payload.content, tags: [] });
+    });
+    return () => {
+      removeCommandListener();
+      removeMarkdownListener();
+    };
+  }, [createMemoMutation, defaultMemoNotebookId, handleCreateMemo, handleCreateNotebook, handleMobileSearch, notebooks, selectedNotebookId, toggleDesktopFocusMode]);
 
   const handleWorkspaceBackRequest = useCallback(() => {
     if (appNoticeDialog) {
@@ -2352,6 +2722,8 @@ export const WorkspaceApp = ({
         ? t("workspace.loading.assets")
         : rightView === "tags"
           ? t("workspace.loading.tags")
+        : rightView === "templates"
+          ? t("templates.title")
         : rightView === "evernote-migration"
           ? t("workspace.loading.migration")
           : t("workspace.loading.editor");
@@ -2370,7 +2742,8 @@ export const WorkspaceApp = ({
         : t("workspace.pullToRefresh.pullPage");
 
   return (
-    <div className="flex h-[100dvh] overflow-hidden bg-slate-50 text-slate-950">
+    <WorkspaceMotionProvider>
+      <div className="flex h-[100dvh] overflow-hidden bg-slate-50 text-slate-950">
       {pullToRefreshVisible && (
         <div
           className="pointer-events-none fixed inset-x-0 top-[max(0.75rem,env(safe-area-inset-top))] z-50 flex justify-center lg:hidden"
@@ -2386,12 +2759,12 @@ export const WorkspaceApp = ({
       <div className="min-w-0 flex-1">
         <main
           className={cn(
-            "grid h-[100dvh] min-h-0 grid-cols-[minmax(0,1fr)]",
+            "edgeever-workspace-grid grid h-[100dvh] min-h-0 grid-cols-[minmax(0,1fr)]",
             desktopFocusModeActive
-              ? "lg:grid-cols-[minmax(0,1fr)]"
+              ? "edgeever-workspace-grid--focus"
               : rightView === "editor"
-                ? "lg:grid-cols-[260px_var(--memo-list-width)_minmax(0,1fr)]"
-                : "lg:grid-cols-[260px_1fr]"
+                ? "edgeever-workspace-grid--editor"
+                : "edgeever-workspace-grid--single-right"
           )}
           style={{ "--memo-list-width": `${memoListWidth}px` } as CSSProperties}
         >
@@ -2408,6 +2781,7 @@ export const WorkspaceApp = ({
             {(isDesktop || visibleActivePane === "notebooks") && (
               <Suspense fallback={<PaneLoadingFallback label={t("workspace.loading.notebooks")} />}>
                 <NotebookPane
+                  repository={repository}
                   authRequired={authRequired}
                   user={user}
                   selectedNotebookId={selectedNotebookId}
@@ -2437,8 +2811,10 @@ export const WorkspaceApp = ({
                   isOnline={isOnline}
                   isSyncingQueuedChanges={isSyncingQueuedChanges}
                   onSyncQueuedChanges={() => void runQueuedSync()}
+                  onDiscardConflicts={() => void discardConflictsNow()}
                   onOpenAssets={handleOpenAssets}
                   onOpenTags={handleOpenTags}
+                  onOpenTemplates={handleOpenTemplates}
                   onOpenSettings={handleOpenSettings}
                   onOpenTrash={() => {
                     navigateWorkspaceTrash();
@@ -2524,7 +2900,9 @@ export const WorkspaceApp = ({
               }}
               onBackFromTrash={handleSelectAllMemos}
               onOpenMemo={(memoId) => {
-                navigateWorkspaceHome();
+                if (shouldNavigateHomeWhenOpeningMemo(memoView)) {
+                  navigateWorkspaceHome();
+                }
                 setRightView("editor");
                 clearPendingCreatedMemo();
                 setCreatedMemoEditId(null);
@@ -2585,11 +2963,15 @@ export const WorkspaceApp = ({
           <section className={cn("min-h-0 min-w-0 bg-white lg:block", visibleActivePane === "editor" ? "block" : "hidden")}>
             {shouldRenderRightPane && (
               <Suspense fallback={<PaneLoadingFallback label={rightPaneLoadingLabel} />}>
-                {rightView === "settings" ? (
-                  <SettingsPane
+                <m.div key={rightView} className="h-full min-h-0 min-w-0" {...paneEnterMotion}>
+                  {rightView === "settings" ? (
+                    <SettingsPane
                     onClose={handleCloseSettings}
+                    onOpenTemplates={handleOpenTemplates}
                     imageCompressionEnabled={imageCompressionEnabled}
                     onImageCompressionChange={setImageCompressionEnabled}
+                    syncIntervalMs={syncIntervalMs}
+                    onSyncIntervalChange={setSyncIntervalMs}
                     shortcutSettings={shortcutSettings}
                     onShortcutSettingsChange={setShortcutSettings}
                     onLogout={onLogout}
@@ -2597,17 +2979,34 @@ export const WorkspaceApp = ({
                     authRequired={authRequired}
                     demoMode={demoMode}
                     isOwner={authRequired && user?.role === "owner"}
-                    onShowGuide={() => setRightView("evernote-migration")}
+                    user={user}
                   />
-                ) : rightView === "assets" ? (
-                  <AssetsPane onClose={handleCloseAssets} activeMemo={selectedMemo} />
-                ) : rightView === "tags" ? (
-                  <TagsPane onClose={handleCloseAssets} />
-                ) : rightView === "evernote-migration" ? (
-                  <EvernoteImportGuidePane onClose={() => setRightView("settings")} />
-                ) : (
-                  <EditorPane
+                  ) : rightView === "assets" ? (
+                    <AssetsPane onClose={handleCloseAssets} activeMemo={selectedMemo} repository={repository} />
+                  ) : rightView === "tags" ? (
+                    <TagsPane onClose={handleCloseAssets} repository={repository} />
+                  ) : rightView === "templates" ? (
+                    <TemplatesPane
+                    canCreateMemo={canCreateMemo}
+                    isCreating={createMemoMutation.isPending || createTemplateMutation.isPending}
+                    onClose={handleCloseTemplates}
+                    onCreateMemo={handleCreateMemo}
+                    onCreateSavedTemplate={async (payload) => {
+                      await createTemplateMutation.mutateAsync(payload);
+                    }}
+                    savedTemplates={savedTemplates}
+                    onUseSavedTemplate={handleUseSavedTemplate}
+                    onDeleteSavedTemplate={(template) => deleteTemplateMutation.mutate(template.id)}
+                    onUpdateSavedTemplate={async (templateId, payload) => {
+                      await updateTemplateMutation.mutateAsync({ templateId, payload });
+                    }}
+                  />
+                  ) : rightView === "evernote-migration" ? (
+                    <EvernoteImportGuidePane onClose={() => setRightView("settings")} />
+                  ) : (
+                    <EditorPane
                     memo={selectedMemo}
+                    repository={repository}
                     desktopFocusMode={desktopFocusModeActive}
                     onToggleDesktopFocusMode={toggleDesktopFocusMode}
                     mobileDefaultEditMemoId={createdMemoEditId}
@@ -2617,6 +3016,12 @@ export const WorkspaceApp = ({
                     contentSearchQuery={search}
                     searchFocusToken={noteSearchFocusToken}
                     replaceFocusToken={noteReplaceFocusToken}
+                    onOpenMemo={(memoId) => {
+                      clearPendingCreatedMemo();
+                      setMemoView("notebook");
+                      setSelectedMemoId(memoId);
+                      setActivePane("editor");
+                    }}
                     imageCompressionEnabled={imageCompressionEnabled}
                     selectionActionBar={memoSelectionActionBar}
                     hasNextMemo={Boolean(nextMemoId)}
@@ -2641,6 +3046,7 @@ export const WorkspaceApp = ({
                       }
                     }}
                     onSaved={async (memo) => {
+                      await putLocalMemo(localDataScope, memo);
                       cacheMemoDetail(queryClient, memo, memoView);
                       updateMemoSummaryInLists(queryClient, memoToSummary(memo));
                       await Promise.all([
@@ -2675,24 +3081,16 @@ export const WorkspaceApp = ({
                       await restoreMemoMutation.mutateAsync(memoId);
                     }}
                     onMobileDefaultEditConsumed={handleMobileDefaultEditConsumed}
-                  />
-                )}
+                    onSaveAsTemplate={handleSaveAsTemplate}
+                    />
+                  )}
+                </m.div>
               </Suspense>
             )}
           </section>
         </main>
       </div>
 
-      {templatesOpen && (
-        <Suspense fallback={null}>
-          <TemplatesDialog
-            canCreateMemo={canCreateMemo}
-            isCreating={createMemoMutation.isPending}
-            onClose={handleCloseTemplates}
-            onCreateMemo={handleCreateMemo}
-          />
-        </Suspense>
-      )}
       {memoDeleteConfirmation && (
         <MemoDeleteConfirmDialog
           confirmation={memoDeleteConfirmation}
@@ -2781,7 +3179,8 @@ export const WorkspaceApp = ({
           onSelect={handleSelectNotebook}
         />
       )}
-    </div>
+      </div>
+    </WorkspaceMotionProvider>
   );
 };
 export default WorkspaceApp;

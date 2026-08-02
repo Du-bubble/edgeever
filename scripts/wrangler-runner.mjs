@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export const resolveWranglerCliPath = (cwd = resolve(".")) =>
@@ -24,6 +24,27 @@ export const buildWranglerEnvironment = (args, env = process.env) => ({
 });
 
 export const normalizeD1MigrationSql = (sql) => sql.replace(/\r\n?/g, "\n");
+
+export const findD1DatabaseIdByName = (json, databaseName) => {
+  let databases;
+  try {
+    databases = JSON.parse(json);
+  } catch {
+    throw new Error("Wrangler returned invalid JSON while listing D1 databases.");
+  }
+
+  if (!Array.isArray(databases)) {
+    throw new Error("Wrangler returned an unexpected response while listing D1 databases.");
+  }
+
+  const matches = databases.filter((database) => database?.name === databaseName);
+  if (matches.length !== 1) {
+    return undefined;
+  }
+
+  const databaseId = matches[0]?.uuid;
+  return typeof databaseId === "string" ? databaseId : undefined;
+};
 
 export const buildWranglerSpawnOptions = (args, options = {}) => {
   if (!isD1MigrationApplyCommand(args) || options.input !== undefined) {
@@ -68,6 +89,20 @@ export const runWranglerSync = (args, options = {}) => {
     result.error = new Error(
       "Node.js 22 or newer is required to run Wrangler reliably. Install Node.js, reopen the terminal, and retry.",
     );
+  }
+
+  // Wrangler can successfully handle --version without writing to the child
+  // pipe when it is launched by Bun's test runner. Preserve the runner's
+  // stdout contract using the version from the exact local package we ran.
+  if (result.status === 0 && args.length === 1 && args[0] === "--version" && !String(result.stdout ?? "").trim()) {
+    try {
+      const metadata = JSON.parse(readFileSync(resolve(cwd, "node_modules", "wrangler", "package.json"), "utf8"));
+      if (typeof metadata.version === "string") {
+        result.stdout = options.encoding ? `${metadata.version}\n` : Buffer.from(`${metadata.version}\n`);
+      }
+    } catch {
+      // Leave the original successful result intact if package metadata is unavailable.
+    }
   }
 
   return result;
