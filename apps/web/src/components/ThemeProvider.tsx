@@ -156,7 +156,7 @@ export const getStoredMermaidTheme = (): MermaidThemeName => {
 
 export const getStoredMermaidRenderer = (): MermaidRenderer => {
   if (typeof window === "undefined") return "mermaid";
-  const stored = window.localStorage.getItem(MERMAID_RENDERER_STORAGE_KEY);
+  const stored = window.localStorage?.getItem(MERMAID_RENDERER_STORAGE_KEY);
   return MERMAID_RENDERERS.includes(stored as MermaidRenderer) ? stored as MermaidRenderer : "mermaid";
 };
 
