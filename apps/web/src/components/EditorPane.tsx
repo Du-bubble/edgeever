@@ -1,10 +1,12 @@
-import { useRef, useState, useEffect, useCallback, useMemo, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useRef, useState, useEffect, useCallback, useMemo, type CSSProperties, type FocusEvent as ReactFocusEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import { NodeViewWrapper, ReactNodeViewRenderer, useEditor, EditorContent, type Editor, type NodeViewProps } from "@tiptap/react";
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
 import Image from "@tiptap/extension-image";
+import { mergeAttributes } from "@tiptap/core";
 import Placeholder from "@tiptap/extension-placeholder";
 import { TableKit } from "@tiptap/extension-table";
 import { useTranslation } from "react-i18next";
@@ -69,6 +71,7 @@ import { ThemeToggle } from "./ThemeToggle";
 import { useTheme } from "./ThemeProvider";
 import { sanitizeAndScopeCss } from "@/lib/css-sandbox";
 import { RevisionHistoryDialog } from "./dialogs/RevisionHistoryDialog";
+import { memoShareQueryKey, ShareMemoDialog } from "./dialogs/ShareMemoDialog";
 import { api } from "@/lib/api";
 import { isDesktopResourceRuntime, stageDesktopResource, toDesktopResourceUrl } from "@/lib/desktop-resources";
 import { cn, formatDateTime, parseTagsText } from "@/lib/utils";
@@ -85,6 +88,7 @@ import {
   type MemoEditSession,
   type TiptapDoc,
   createMemoLinkHref,
+  getImageReferrerPolicy,
   parseMemoLinkHref,
 } from "@edgeever/shared";
 import {
@@ -143,6 +147,49 @@ const IconTooltip = ({ label, children }: { label: string; children: ReactNode }
       <TooltipContent side="bottom">{label}</TooltipContent>
     </Tooltip>
   </TooltipProvider>
+);
+
+type NoteLinkHintPosition = {
+  left: number;
+  top: number;
+  placement: "above" | "below";
+};
+
+const getNoteLinkFromEventTarget = (target: EventTarget | null) =>
+  target instanceof Element
+    ? target.closest<HTMLAnchorElement>('a.edgeever-note-link, a[href^="#memo="]')
+    : null;
+
+const getNoteLinkHintPosition = (link: HTMLAnchorElement): NoteLinkHintPosition => {
+  const rect = link.getBoundingClientRect();
+  const placement = rect.top < 48 ? "below" : "above";
+
+  return {
+    left: Math.min(Math.max(rect.left + rect.width / 2, 12), window.innerWidth - 12),
+    top: placement === "above" ? rect.top - 8 : rect.bottom + 8,
+    placement,
+  };
+};
+
+const NoteLinkInteractionHint = ({
+  label,
+  position,
+}: {
+  label: string;
+  position: NoteLinkHintPosition;
+}) => createPortal(
+  <div
+    role="tooltip"
+    className="pointer-events-none fixed z-[100] whitespace-nowrap rounded-md bg-slate-950 px-2.5 py-1.5 text-xs font-medium text-white shadow-md"
+    style={{
+      left: position.left,
+      top: position.top,
+      transform: position.placement === "above" ? "translate(-50%, -100%)" : "translateX(-50%)",
+    }}
+  >
+    {label}
+  </div>,
+  document.body
 );
 
 type NoteSearchMatch = {
@@ -374,7 +421,13 @@ const ResizableImageNodeView = ({ editor, node, selected, updateAttributes }: No
       style={{ width: `${width}%` }}
       data-width={width}
     >
-      <img src={src} alt={alt} title={title || undefined} draggable={false} />
+      <img
+        src={src}
+        alt={alt}
+        title={title || undefined}
+        draggable={false}
+        referrerPolicy={getImageReferrerPolicy(src)}
+      />
       {editable && selected && (
         <div className="edgeever-image-controls" contentEditable={false}>
           <div className="edgeever-image-presets" aria-label={t("editor.imageScale")}>
@@ -422,6 +475,17 @@ const ResizableImage = Image.extend({
   },
   addNodeView() {
     return ReactNodeViewRenderer(ResizableImageNodeView);
+  },
+  renderHTML({ HTMLAttributes }) {
+    const referrerPolicy = getImageReferrerPolicy(HTMLAttributes.src);
+    return [
+      "img",
+      mergeAttributes(
+        this.options.HTMLAttributes,
+        HTMLAttributes,
+        referrerPolicy ? { referrerpolicy: referrerPolicy } : {},
+      ),
+    ];
   },
 });
 
@@ -625,6 +689,7 @@ const RichEditorPane = ({
   const [editorContentVersion, setEditorContentVersion] = useState(0);
   const [imageUploadState, setImageUploadState] = useState<"idle" | "compressing" | "uploading" | "error">("idle");
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
   const [systemInfoOpen, setSystemInfoOpen] = useState(false);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [mobileNotebookSheetOpen, setMobileNotebookSheetOpen] = useState(false);
@@ -636,6 +701,7 @@ const RichEditorPane = ({
   const [noteSearchIndex, setNoteSearchIndex] = useState(0);
   const [noteLinkPickerOpen, setNoteLinkPickerOpen] = useState(false);
   const [noteLinkQuery, setNoteLinkQuery] = useState("");
+  const [noteLinkHintPosition, setNoteLinkHintPosition] = useState<NoteLinkHintPosition | null>(null);
   const [isMobileViewport, setIsMobileViewport] = useState(() =>
     typeof window === "undefined" ? false : window.matchMedia(MOBILE_EDITOR_QUERY).matches
   );
@@ -649,6 +715,10 @@ const RichEditorPane = ({
   const [mobileImeDebugActiveElement, setMobileImeDebugActiveElement] = useState(getActiveElementLabel);
   const [mobileImeDebugEvents, setMobileImeDebugEvents] = useState<MobileImeDebugEntry[]>([]);
   const [wechatCopyState, setWechatCopyState] = useState<"idle" | "copying" | "copied" | "error">("idle");
+  const noteLinkModifier = useMemo(
+    () => typeof navigator !== "undefined" && /mac|iphone|ipad|ipod/i.test(navigator.platform) ? "⌘" : "Ctrl",
+    []
+  );
   const noteLinkResultsQuery = useQuery({
     queryKey: ["memo-link-search", noteLinkQuery],
     queryFn: () => repository.listMemos({ q: noteLinkQuery, limit: 20 }),
@@ -661,6 +731,18 @@ const RichEditorPane = ({
   }, []);
   const notebookOptions = useMemo(() => getNotebookMoveOptions(notebooks), [notebooks]);
   const readOnly = isTrashView || Boolean(memo?.isDeleted);
+  const shareMemoId = memo && !readOnly && !isLocalMemoId(memo.id) ? memo.id : null;
+  const shareStatusQuery = useQuery({
+    queryKey: memoShareQueryKey(shareMemoId ?? ""),
+    queryFn: () => {
+      if (!shareMemoId) throw new Error("Memo share query requires a memo id");
+      return api.getMemoShare(shareMemoId);
+    },
+    enabled: Boolean(shareMemoId),
+    retry: false,
+    staleTime: 30_000,
+  });
+  const isMemoShared = Boolean(shareStatusQuery.data?.share);
   const mobileDefaultEditRequested = Boolean(memo?.id && memo.id === mobileDefaultEditMemoId && !readOnly);
   const mobileEditingActive = isMobileEditing || mobileDefaultEditRequested;
 
@@ -1025,6 +1107,63 @@ const RichEditorPane = ({
     setNoteLinkPickerOpen(false);
     setNoteLinkQuery("");
   }, [editor, effectiveReadOnly, memo?.id, t]);
+
+  const showNoteLinkHint = useCallback((target: EventTarget | null) => {
+    if (!editor?.isEditable || isMobileViewport) {
+      return;
+    }
+
+    const link = getNoteLinkFromEventTarget(target);
+    if (link) {
+      setNoteLinkHintPosition(getNoteLinkHintPosition(link));
+    }
+  }, [editor?.isEditable, isMobileViewport]);
+
+  const handleEditorMouseOver = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    showNoteLinkHint(event.target);
+  }, [showNoteLinkHint]);
+
+  const handleEditorMouseOut = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    const link = getNoteLinkFromEventTarget(event.target);
+    if (!link || (event.relatedTarget instanceof Node && link.contains(event.relatedTarget))) {
+      return;
+    }
+    setNoteLinkHintPosition(null);
+  }, []);
+
+  const handleEditorClickCapture = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.button === 0 && !event.ctrlKey && !event.metaKey) {
+      showNoteLinkHint(event.target);
+    }
+  }, [showNoteLinkHint]);
+
+  const handleEditorFocusCapture = useCallback((event: ReactFocusEvent<HTMLDivElement>) => {
+    showNoteLinkHint(event.target);
+  }, [showNoteLinkHint]);
+
+  const handleEditorBlurCapture = useCallback((event: ReactFocusEvent<HTMLDivElement>) => {
+    if (!getNoteLinkFromEventTarget(event.relatedTarget)) {
+      setNoteLinkHintPosition(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!noteLinkHintPosition) {
+      return;
+    }
+
+    const hideHint = () => setNoteLinkHintPosition(null);
+    window.addEventListener("resize", hideHint);
+    window.addEventListener("scroll", hideHint, true);
+    return () => {
+      window.removeEventListener("resize", hideHint);
+      window.removeEventListener("scroll", hideHint, true);
+    };
+  }, [noteLinkHintPosition]);
+
+  useEffect(() => {
+    setNoteLinkHintPosition(null);
+  }, [memo?.id, isMarkdownMode]);
 
   useEffect(() => {
     imageCompressionEnabledRef.current = imageCompressionEnabled;
@@ -1986,7 +2125,7 @@ const RichEditorPane = ({
     saveState === "error" || saveState === "conflict"
       ? "bg-rose-50 text-rose-700"
       : saveState === "queued"
-        ? "bg-amber-50/60 text-amber-600/80"
+        ? "bg-slate-50 text-slate-400"
         : saveState === "saving" || hasUnsavedChanges
           ? "bg-emerald-50 text-emerald-700"
           : "bg-slate-100 text-slate-500";
@@ -2283,6 +2422,18 @@ const RichEditorPane = ({
           </div>
 
           <div className="flex shrink-0 items-center gap-1">
+            {isMemoShared && (
+              <button
+                className="inline-flex h-8 items-center gap-1.5 rounded-full bg-emerald-50 px-2 text-xs font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-200 transition-colors hover:bg-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+                type="button"
+                title={t("sharing.manage")}
+                aria-label={t("sharing.manage")}
+                onClick={() => setShareOpen(true)}
+              >
+                <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
+                <span className="hidden sm:inline">{t("sharing.active")}</span>
+              </button>
+            )}
             <span
               className="hidden whitespace-nowrap px-1.5 text-xs tabular-nums text-slate-400 sm:inline-flex"
               title={t("editor.characterCount", { count: characterCount })}
@@ -2480,6 +2631,19 @@ const RichEditorPane = ({
                   <History className="h-4 w-4 text-slate-500" />
                   {t("editor.versionHistory")}
                 </DropdownMenuItem>
+                {!readOnly && (
+                  <DropdownMenuItem
+                    className={cn(
+                      "flex h-9 w-full items-center gap-2 px-3 text-left text-sm hover:bg-slate-50 cursor-pointer outline-none",
+                      isMemoShared ? "bg-emerald-50 text-emerald-800" : "text-slate-700",
+                    )}
+                    disabled={isLocalMemoId(memo.id)}
+                    onClick={() => setShareOpen(true)}
+                  >
+                    <Link2 className={cn("h-4 w-4", isMemoShared ? "text-emerald-600" : "text-slate-500")} />
+                    {t(isMemoShared ? "sharing.manage" : "sharing.action")}
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem
                   className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
                   onClick={handleExportMarkdown}
@@ -2715,7 +2879,11 @@ const RichEditorPane = ({
       <div
         ref={setEditorScrollContainerRef}
         data-editor-theme={
-          editorTheme === "default" || editorTheme === "minimal-emerald" || editorTheme === "outline-emerald"
+          editorTheme === "default" ||
+          editorTheme === "minimal-emerald" ||
+          editorTheme === "outline-emerald" ||
+          editorTheme === "wechat-green" ||
+          editorTheme === "modern-mint"
             ? editorTheme
             : "custom"
         }
@@ -2724,7 +2892,11 @@ const RichEditorPane = ({
           "--editor-body-line-height": String(MEMO_CONTENT_STYLE.body.lineHeight / MEMO_CONTENT_STYLE.body.fontSize),
           "--memo-content-divider-color": MEMO_CONTENT_STYLE.divider.color[resolvedTheme],
           "--memo-content-divider-spacing": `${MEMO_CONTENT_STYLE.divider.marginVertical}px`,
-          ...(editorTheme !== "default" && editorTheme !== "minimal-emerald" && editorTheme !== "outline-emerald"
+          ...(editorTheme !== "default" &&
+          editorTheme !== "minimal-emerald" &&
+          editorTheme !== "outline-emerald" &&
+          editorTheme !== "wechat-green" &&
+          editorTheme !== "modern-mint"
             ? {
                 "--editor-theme-bg": (resolvedTheme === "dark" ? customEditorTheme.dark : customEditorTheme.light).background,
                 "--editor-theme-text": (resolvedTheme === "dark" ? customEditorTheme.dark : customEditorTheme.light).text,
@@ -2743,6 +2915,8 @@ const RichEditorPane = ({
         {editorTheme !== "default" &&
           editorTheme !== "minimal-emerald" &&
           editorTheme !== "outline-emerald" &&
+          editorTheme !== "wechat-green" &&
+          editorTheme !== "modern-mint" &&
           customEditorTheme.customCss && (
             <style
               data-theme-custom-css
@@ -2817,7 +2991,15 @@ const RichEditorPane = ({
                 placeholder={`# ${t("editor.placeholder")}`}
               />
             ) : (
-              <EditorContent editor={editor} />
+              <div
+                onMouseOver={handleEditorMouseOver}
+                onMouseOut={handleEditorMouseOut}
+                onClickCapture={handleEditorClickCapture}
+                onFocusCapture={handleEditorFocusCapture}
+                onBlurCapture={handleEditorBlurCapture}
+              >
+                <EditorContent editor={editor} />
+              </div>
             )}
           </div>
           {!isMobileViewport && !useMobilePlainTextEditor && !useMarkdownSourceEditor && (
@@ -2830,6 +3012,13 @@ const RichEditorPane = ({
           )}
         </div>
       </div>
+
+      {noteLinkHintPosition && (
+        <NoteLinkInteractionHint
+          label={t("noteLinkPicker.openHint", { modifier: noteLinkModifier })}
+          position={noteLinkHintPosition}
+        />
+      )}
 
       {false && useMobilePlainTextEditor && (
         <div className="fixed left-2 right-2 top-[max(3.5rem,env(safe-area-inset-top))] z-[70] rounded-md border border-amber-200 bg-amber-50/95 p-2 text-[11px] text-slate-800 shadow-lg backdrop-blur sm:hidden">
@@ -2943,6 +3132,8 @@ const RichEditorPane = ({
       )}
 
       <SystemInfoDialog open={systemInfoOpen} onOpenChange={setSystemInfoOpen} />
+
+      <ShareMemoDialog memoId={memo.id} open={shareOpen} onOpenChange={setShareOpen} />
 
       {mobileNotebookSheetOpen && (
         <MobileNotebookSelectSheet

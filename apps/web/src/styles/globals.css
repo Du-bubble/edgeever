@@ -215,6 +215,35 @@ textarea {
   padding: 8px 12px 56px;
 }
 
+.edgeever-public-share .ProseMirror {
+  min-height: 0;
+  padding: 8px 20px 40px;
+  color: #0f172a;
+}
+
+.edgeever-public-share .ProseMirror [data-edgeever-theme-block] {
+  margin: 1.25rem 0;
+  border: 1px solid #dbeee5;
+  border-radius: 6px;
+  background: #fbfefc;
+  padding: 0.8rem 1rem;
+}
+
+.edgeever-public-share .ProseMirror [data-theme-block-kind="chapter"] {
+  border-left: 4px solid var(--brand-green);
+  background: var(--brand-green-soft);
+}
+
+:root.dark .edgeever-public-share .ProseMirror {
+  color: #0f172a;
+}
+
+@media (min-width: 640px) {
+  .edgeever-public-share .ProseMirror {
+    padding-inline: 36px;
+  }
+}
+
 .ProseMirror .edgeever-search-match {
   border-radius: 0.2rem;
   background-color: rgb(254 240 138 / 0.8);
@@ -517,7 +546,8 @@ textarea {
   align-items: center;
   justify-content: center;
   overflow: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior-x: contain;
+  overscroll-behavior-y: auto;
   padding: 3.25rem 1rem 1rem;
   border: 1px solid #d9e2dc;
   border-radius: 8px;
@@ -546,10 +576,10 @@ textarea {
 
 .ProseMirror .edgeever-mermaid-svg svg {
   display: block;
-  width: 100%;
+  width: auto;
   max-width: 100%;
   height: auto;
-  max-height: none;
+  max-height: 30rem;
 }
 
 .ProseMirror .edgeever-mermaid-source {
