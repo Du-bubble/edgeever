@@ -112,6 +112,14 @@ jobs:
               -m "chore: update EdgeEver from ${TARGET_REF}" "${TARGET_COMMIT}"
           fi
 
+      - name: Apply browser storage compatibility fix
+        if: steps.upstream.outputs.update_required == 'true'
+        run: |
+          perl -0pi -e 's/window\.localStorage\.getItem\(MERMAID_RENDERER_STORAGE_KEY\)/window.localStorage?.getItem(MERMAID_RENDERER_STORAGE_KEY)/g' \
+            apps/web/src/components/ThemeProvider.tsx
+          grep -q 'window.localStorage?.getItem(MERMAID_RENDERER_STORAGE_KEY)' \
+            apps/web/src/components/ThemeProvider.tsx
+
       - name: Set up Bun
         if: steps.upstream.outputs.update_required == 'true'
         uses: oven-sh/setup-bun@v2
