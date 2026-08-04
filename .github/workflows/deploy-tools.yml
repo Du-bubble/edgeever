@@ -37,6 +37,7 @@ permissions:
 
 jobs:
   wrangler:
+    if: github.repository == 'tianma-if/edgeever'
     name: Wrangler runner (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
