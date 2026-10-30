@@ -2679,6 +2679,7 @@ export const pl = {
         "bebas": "Bebas Neue",
         "spacegrotesk": "Space Grotesk",
         "jetbrains": "JetBrains Mono",
+        mapleMonoCn: "Maple Mono CN",
 
         auto: "Zgodnie z motywem",
         kai: "Pismo odręczne / Kaligrafia",

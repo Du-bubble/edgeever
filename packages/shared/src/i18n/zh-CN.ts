@@ -2688,6 +2688,7 @@ export const zhCN = {
         "bebas": "Bebas Neue",
         "spacegrotesk": "Space Grotesk",
         "jetbrains": "JetBrains Mono",
+        mapleMonoCn: "Maple Mono CN",
 
         auto: "跟随主题",
         kai: "文楷手书",

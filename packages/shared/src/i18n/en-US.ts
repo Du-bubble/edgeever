@@ -2690,6 +2690,7 @@ export const enUS = {
         "bebas": "Bebas Neue",
         "spacegrotesk": "Space Grotesk",
         "jetbrains": "JetBrains Mono",
+        mapleMonoCn: "Maple Mono CN",
 
         auto: "Follow Theme",
         kai: "Handwritten Kai",

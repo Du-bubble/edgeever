@@ -2690,6 +2690,7 @@ export const ru = {
         "bebas": "Bebas Neue",
         "spacegrotesk": "Space Grotesk",
         "jetbrains": "JetBrains Mono",
+        mapleMonoCn: "Maple Mono CN",
 
         auto: "Как в теме",
         kai: "Рукописный кай",

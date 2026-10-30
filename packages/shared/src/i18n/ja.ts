@@ -2679,6 +2679,7 @@ export const ja = {
         "bebas": "Bebas Neue",
         "spacegrotesk": "Space Grotesk",
         "jetbrains": "JetBrains Mono",
+        mapleMonoCn: "Maple Mono CN",
 
         auto: "テーマに合わせる",
         kai: "手書き・楷書",
