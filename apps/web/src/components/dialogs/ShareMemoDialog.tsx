@@ -229,7 +229,7 @@ export const ShareMemoDialog = ({
 
             <div className="space-y-3 border-t border-slate-100 pt-3">
               <div className="flex items-center justify-between gap-3">
-                <label htmlFor="share-show-updated-at" className="text-sm font-medium text-slate-800">{t("sharing.showUpdatedAt")}</label>
+                <label htmlFor="share-show-updated-at" className="text-xs font-normal leading-5 text-slate-600">{t("sharing.showUpdatedAt")}</label>
                 <Switch
                   id="share-show-updated-at"
                   aria-label={t("sharing.showUpdatedAt")}
@@ -239,7 +239,7 @@ export const ShareMemoDialog = ({
                 />
               </div>
               <div className="flex items-center justify-between gap-3">
-                <label htmlFor="share-show-branding" className="text-sm font-medium text-slate-800">{t("sharing.showBranding")}</label>
+                <label htmlFor="share-show-branding" className="text-xs font-normal leading-5 text-slate-600">{t("sharing.showBranding")}</label>
                 <Switch
                   id="share-show-branding"
                   aria-label={t("sharing.showBranding")}
