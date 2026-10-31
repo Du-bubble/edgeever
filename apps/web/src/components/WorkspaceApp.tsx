@@ -3815,7 +3815,6 @@ export const WorkspaceApp = ({
                         />
                       ) : selectedMemo && selectedInfographicNote ? (
                         <InfographicEditorPane
-                          key={selectedMemo.id}
                           memo={selectedMemo}
                           notebooks={notebooks}
                           repository={repository}

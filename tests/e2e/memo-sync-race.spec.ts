@@ -222,7 +222,7 @@ test("preserves a mind-map draft when an earlier autosave is acknowledged", asyn
     // Keep the next edit inside the real 1,200 ms debounce window while the
     // previous response arrives. X6 still gets its animation frames.
     await page.clock.install();
-    await page.clock.pauseAt(new Date());
+    await page.clock.pauseAt(new Date(await page.evaluate(() => Date.now()) + 1_000));
     await canvas.focus();
     await page.keyboard.press("Tab");
     await page.clock.runFor(100);
@@ -383,7 +383,7 @@ test("keeps a new mind-map editor and its draft when its temporary id is remappe
     const canvas = page.locator('[data-diagram-kind="mind-map"]');
     await expect(canvas.locator(".x6-node")).toHaveCount(8);
     await page.clock.install();
-    await page.clock.pauseAt(new Date());
+    await page.clock.pauseAt(new Date(await page.evaluate(() => Date.now()) + 1_000));
     const title = page.getByRole("textbox", { name: "图表标题", exact: true });
     const marker = `new-diagram-${Date.now()}`;
     await title.fill(marker);
