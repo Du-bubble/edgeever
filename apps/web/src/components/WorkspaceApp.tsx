@@ -1111,6 +1111,8 @@ export const WorkspaceApp = ({
     networkMode: "offlineFirst",
     queryKey: ["memos", memoView, selectedNotebookId, search, memoFilterMode, memoSortMode, selectedNotebookScopeIds, selectedTag],
     queryFn: ({ pageParam }) => repository.listMemos({
+        includeTotal: !pageParam,
+        cursor: pageParam,
         notebookId: memoView === "notebook" && !selectedTag ? selectedNotebookId : null,
         notebookIds: memoView === "notebook" && !selectedTag ? selectedNotebookScopeIds : undefined,
         q: search,
