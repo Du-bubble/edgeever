@@ -75,6 +75,62 @@ describe("consistent backup reads across a real schema upgrade", () => {
     expect((await db.request("/api/v1/backups/json")).status).toBe(200);
   });
 
+  test("counts the source only for snapshots, never for each backup page", async () => {
+    const db = await installation();
+    const queries = [];
+    const prepare = db.storage.db.prepare.bind(db.storage.db);
+    db.storage.db.prepare = (sql) => { queries.push(sql); return prepare(sql); };
+    const state = await (await db.request("/api/v1/backups/state")).json();
+    const isFullCount = (sql) => /COUNT\s*\(/i.test(sql) && /backup_revision/.test(sql);
+    expect(queries.filter(isFullCount)).toHaveLength(1);
+    queries.length = 0;
+    for (const kind of ["memos", "notebooks", "prompts"]) {
+      let after = "";
+      let count = 0;
+      do {
+        const response = await db.request(pageUrl(state, kind, after));
+        expect(response.status).toBe(200);
+        const page = await response.json();
+        count += page[kind].length;
+        after = page.nextCursor;
+      } while (after !== null);
+      expect(count).toBe(state.counts[kind]);
+    }
+    expect(queries.filter(isFullCount)).toHaveLength(0);
+    const final = await (await db.request("/api/v1/backups/state")).json();
+    expect(final).toEqual(state);
+    expect(queries.filter(isFullCount)).toHaveLength(1);
+  });
+
+  for (const change of ["revision", "identity"]) test(`rejects a ${change} change while assembling a page`, async () => {
+    const db = await installation();
+    const state = await (await db.request("/api/v1/backups/state")).json();
+    const prepare = db.storage.db.prepare.bind(db.storage.db);
+    let checks = 0;
+    db.storage.db.prepare = (sql) => {
+      const statement = prepare(sql);
+      if (!/FROM workspaces/.test(sql)) return statement;
+      const bind = statement.bind.bind(statement);
+      statement.bind = (...values) => {
+        const bound = bind(...values);
+        const first = bound.first.bind(bound);
+        bound.first = async (...args) => {
+          if (++checks === 2) {
+            if (change === "revision") db.sqlite.query("UPDATE memo_contents SET content_markdown = 'Changed during read' WHERE memo_id = ?").run(db.note.id);
+            else db.sqlite.exec("UPDATE workspaces SET created_at = 'replacement-instance' WHERE id = 'ws_default'");
+          }
+          return first(...args);
+        };
+        return bound;
+      };
+      return statement;
+    };
+    const response = await db.request(pageUrl(state));
+    expect(checks).toBe(2);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: { code: "backup_source_changed" } });
+  });
+
   test("covers content, revisions, resources, prompts and deletions in their transaction", async () => {
     const db = await installation();
     const changes = [

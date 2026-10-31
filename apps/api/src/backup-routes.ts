@@ -147,6 +147,13 @@ type BackupStateRow = {
   prompts: number;
 };
 
+// Page checks need only the transactional revision. Recounting every table here
+// makes a full backup quadratic in source size and can exhaust D1's daily reads.
+const readBackupVersion = (database: DatabaseAdapter, workspaceId: string) => database.prepare(
+  `SELECT created_at AS identity, CAST(backup_revision AS TEXT) AS backup_revision
+   FROM workspaces WHERE id = ?`,
+).bind(workspaceId).first<Pick<BackupStateRow, "identity" | "backup_revision">>();
+
 const readBackupState = (database: DatabaseAdapter, workspaceId: string) => database.prepare(
   `SELECT w.created_at AS identity, CAST(w.backup_revision AS TEXT) AS backup_revision,
      (SELECT COUNT(*) FROM notebooks WHERE workspace_id = w.id AND is_deleted = 0) AS notebooks,
@@ -275,7 +282,7 @@ export const registerBackupRoutes = (
     const workspaceId = getWorkspaceId(context);
     const database = context.env.storage.db;
     const unchanged = async () => {
-      const state = await readBackupState(database, workspaceId);
+      const state = await readBackupVersion(database, workspaceId);
       return state?.identity === identity && state.backup_revision === revision;
     };
     const changed = () => conflict(context, "backup_source_changed", "The source changed during backup. Try again when it is idle.");
