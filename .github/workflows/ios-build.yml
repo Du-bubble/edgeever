@@ -6,12 +6,10 @@ on:
       - main
     paths:
       - "apps/ios/**"
-      - "apps/desktop/src/main/wechat-chat-transcript.cjs"
       - ".github/workflows/ios-build.yml"
   pull_request:
     paths:
       - "apps/ios/**"
-      - "apps/desktop/src/main/wechat-chat-transcript.cjs"
       - ".github/workflows/ios-build.yml"
   workflow_dispatch:
 
@@ -71,7 +69,6 @@ jobs:
           DEST="$(
             xcodebuild -project EdgeEver.xcodeproj -scheme EdgeEver -showdestinations 2>/dev/null \
               | sed -n 's/.*name:\(iPhone[^,}]*\).*/\1/p' \
-              | sed 's/[[:space:]]*$//' \
               | head -1
           )"
           if [[ -z "$DEST" ]]; then

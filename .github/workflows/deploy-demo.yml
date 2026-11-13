@@ -46,18 +46,11 @@ jobs:
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - name: Install dependencies
-        run: |
-          for attempt in 1 2 3; do
-            if bun install --frozen-lockfile; then
-              exit 0
-            fi
-            if [[ "$attempt" = "3" ]]; then
-              exit 1
-            fi
-            sleep "$((15 * attempt))"
-          done
+        run: bun install --frozen-lockfile
 
       - name: Resolve Release metadata
         env:
